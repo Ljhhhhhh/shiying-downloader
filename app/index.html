@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>拾影 · 视频下载器</title><link rel="stylesheet" href="style.css"></head>
+<body>
+  <aside>
+    <div class="brand"><span class="brand-icon" aria-hidden="true"><svg viewBox="0 0 32 32"><path d="M10 6v15m-5-5 5 5 5-5M21 11v15m-5-5 5 5 5-5"/></svg></span><span>拾影<small>视频下载器</small></span></div>
+    <div class="nav-item"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></svg>我的下载<span id="count">0</span></div>
+    <div class="sidebar-bottom"><span class="local-dot"></span>文件保存在你的设备上<small>拾影 1.0</small></div>
+  </aside>
+  <main>
+    <header><div class="eyebrow">把喜欢的，留在本地</div><h1>下载一段好内容<span>。</span></h1><p>粘贴视频链接，剩下的交给拾影。</p></header>
+    <section class="composer" aria-label="新建下载">
+      <form id="download-form">
+        <label for="url">视频链接</label>
+        <div class="url-field"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m10 14 4-4m-6 7-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0m2-1 1-1a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0"/></svg><input id="url" type="url" required maxlength="8192" placeholder="https://…" autocomplete="off" spellcheck="false" aria-describedby="url-help"></div>
+        <div id="url-help" class="hint">支持多种视频网站，每次下载一个视频。</div>
+        <div class="options"><div class="quality"><label for="quality">下载画质</label><select id="quality"><option value="best">最佳画质</option><option value="1080">最高 1080p</option><option value="720">最高 720p</option><option value="audio">仅音频 · M4A</option></select></div><button id="start" class="primary" type="submit"><span>开始下载</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v15m-6-6 6 6 6-6"/></svg></button></div>
+      </form>
+      <div class="save-row"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7V4h6l3 3h9v13H3Z"/></svg><span id="directory" title="">正在读取保存位置…</span><button id="choose" type="button" class="text-button">更改</button><button id="open-folder" type="button" class="text-button">打开文件夹</button></div>
+    </section>
+    <div id="message" role="alert" hidden></div>
+    <section class="downloads" aria-label="下载记录"><div class="section-title"><h2>下载记录 <span id="total">0</span></h2><button id="clear" type="button" class="text-button" disabled>清空记录</button></div><div id="jobs"></div><div id="empty"><div class="empty-symbol" aria-hidden="true"><svg viewBox="0 0 48 48"><path d="M10 31v8h28v-8M24 8v22m-8-8 8 8 8-8"/></svg></div><h3>第一段收藏，从这里开始</h3><p>复制视频链接，粘贴到上方即可下载。</p></div></section>
+    <footer>视频按源格式保存，分离的音视频会自动合并。<span>仅下载你有权保存的内容。</span></footer>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

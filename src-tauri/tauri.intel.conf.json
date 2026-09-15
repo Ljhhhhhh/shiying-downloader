@@ -1,0 +1,1 @@
+{ "bundle": { "resources": { "../vendor/mac-arm64/": null, "../vendor/mac-x64/": "engines/" } } }
