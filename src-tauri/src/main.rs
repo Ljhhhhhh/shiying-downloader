@@ -3,10 +3,11 @@
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Mutex};
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     process::Command,
     sync::oneshot,
 };
@@ -16,6 +17,8 @@ use tokio::{
 struct Job {
     id: String,
     url: String,
+    #[serde(default)]
+    source: String,
     quality: String,
     title: String,
     status: String,
@@ -38,7 +41,21 @@ struct AppState {
     store: Mutex<Store>,
     active: Mutex<Option<Active>>,
     config: PathBuf,
+    pending: Mutex<Option<Import>>,
 }
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Import {
+    video_id: String,
+    page: String,
+    title: String,
+    media: String,
+    audio: String,
+    duration: f64,
+    width: u32,
+    height: u32,
+}
+const REFERER: &str = "https://www.douyin.com/";
 
 fn save(state: &AppState) -> Result<(), String> {
     let bytes =
@@ -66,21 +83,75 @@ fn validate(url: &str, quality: &str) -> Result<String, String> {
     if url.len() > 8192 {
         return Err("链接过长，请重新复制视频链接。".into());
     }
-    let parsed =
-        url::Url::parse(url.trim()).map_err(|_| "链接格式不正确，请粘贴完整的视频链接。")?;
-    if !["https", "http"].contains(&parsed.scheme())
-        || parsed.host_str().is_none()
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-    {
-        return Err("仅支持不含账号密码的 http 或 https 链接。".into());
-    }
     if !["best", "1080", "720", "audio"].contains(&quality) {
         return Err("请选择有效的画质。".into());
     }
-    Ok(parsed.to_string())
+    let parse_link = |candidate: &str| {
+        let parsed = url::Url::parse(candidate).ok()?;
+        (["https", "http"].contains(&parsed.scheme())
+            && parsed.host_str().is_some()
+            && parsed.username().is_empty()
+            && parsed.password().is_none())
+        .then(|| parsed.to_string())
+    };
+    if let Some(link) = parse_link(url.trim()) {
+        return Ok(link);
+    }
+    for (index, _) in url.match_indices("http") {
+        let candidate = &url[index..];
+        if !candidate.starts_with("https://") && !candidate.starts_with("http://") {
+            continue;
+        }
+        let candidate = candidate
+            .split(|c: char| c.is_whitespace() || "<>[](){}\"'，。！？、；;".contains(c))
+            .next()
+            .unwrap_or("");
+        if let Some(link) = parse_link(candidate) {
+            return Ok(link);
+        }
+    }
+    Err("未找到有效的视频链接，请粘贴完整链接或分享内容。".into())
 }
-fn args(url: &str, quality: &str, directory: &str, engines: &std::path::Path) -> Vec<String> {
+fn args_for(
+    url: &str,
+    quality: &str,
+    directory: &str,
+    engines: &std::path::Path,
+    referer: Option<&str>,
+) -> Vec<String> {
+    args_named(url, quality, directory, engines, referer, None)
+}
+fn safe_stem(title: &str, id: &str, audio: bool) -> String {
+    let mut stem: String = title
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || "- _".contains(c) {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    stem = stem.split_whitespace().collect::<Vec<_>>().join(" ");
+    let stem: String = stem.chars().take(50).collect();
+    let stem = if stem.is_empty() {
+        "douyin"
+    } else {
+        stem.trim()
+    };
+    format!(
+        "{stem} [{id}]{}.%(ext)s",
+        if audio { " - audio" } else { " - video" }
+    )
+}
+fn args_named(
+    url: &str,
+    quality: &str,
+    directory: &str,
+    engines: &std::path::Path,
+    referer: Option<&str>,
+    name: Option<(&str, &str)>,
+) -> Vec<String> {
     let runtime = engines.join(if cfg!(windows) { "deno.exe" } else { "deno" });
     let mut result: Vec<String> = [
         "--ignore-config",
@@ -100,6 +171,13 @@ fn args(url: &str, quality: &str, directory: &str, engines: &std::path::Path) ->
         "--ffmpeg-location".into(),
         engines.to_string_lossy().into_owned(),
     ]);
+    let output = if let Some((title, id)) = name {
+        safe_stem(title, id, quality == "audio")
+    } else if quality == "audio" {
+        "%(title).150B [%(id)s] - audio.%(ext)s".into()
+    } else {
+        "%(title).150B [%(id)s].%(ext)s".into()
+    };
     result.extend(
         [
             "--socket-timeout",
@@ -122,11 +200,7 @@ fn args(url: &str, quality: &str, directory: &str, engines: &std::path::Path) ->
             "-P",
             directory,
             "-o",
-            if quality == "audio" {
-                "%(title).150B [%(id)s] - audio.%(ext)s"
-            } else {
-                "%(title).150B [%(id)s].%(ext)s"
-            },
+            &output,
         ]
         .map(String::from),
     );
@@ -153,11 +227,106 @@ fn args(url: &str, quality: &str, directory: &str, engines: &std::path::Path) ->
             "-f".into(),
             format!("bv*{cap}+ba/b{cap}"),
             "--merge-output-format".into(),
-            "mkv".into(),
+            (if name.is_some() { "mp4" } else { "mkv" }).into(),
         ]);
+    }
+    if let Some(referer) = referer {
+        result.extend(["--referer".into(), referer.into()]);
     }
     result.extend(["--".into(), url.into()]);
     result
+}
+fn vod_url(input: &str, kind: &str) -> Result<String, String> {
+    let media = validate(input, "best")?;
+    let parsed = url::Url::parse(&media).unwrap();
+    let host = parsed.host_str().unwrap_or("");
+    if parsed.scheme() != "https"
+        || parsed.port().is_some()
+        || !(host == "douyinvod.com" || host.ends_with(".douyinvod.com"))
+        || !parsed.path().contains(&format!("/media-{kind}-"))
+    {
+        return Err("画面或声音地址无效，请回到抖音播放后重新发送。".into());
+    }
+    Ok(media)
+}
+fn import_from(link: &url::Url) -> Result<Import, String> {
+    if link.scheme() != "shiying" || link.host_str() != Some("download") {
+        return Err("无法识别的拾影链接。".into());
+    }
+    if link.as_str().len() > 16 * 1024 {
+        return Err("发送内容过大。".into());
+    }
+    let q = |name: &str| {
+        link.query_pairs()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.into_owned())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| format!("缺少{name}"))
+    };
+    if q("v")? != "2" {
+        return Err("扩展版本不受支持，请在 Chrome 扩展程序页面重新加载拾影。".into());
+    }
+    let video_id = q("id")?;
+    if video_id.len() > 32 || !video_id.chars().all(|c| c.is_ascii_digit()) {
+        return Err("视频编号无效。".into());
+    }
+    let page = q("page")?;
+    let page_url = url::Url::parse(&page).map_err(|_| "原视频页面无效。")?;
+    if page_url.scheme() != "https"
+        || !matches!(page_url.host_str(), Some("www.douyin.com" | "v.douyin.com"))
+        || page.len() > 300
+    {
+        return Err("原视频页面无效。".into());
+    }
+    let title = q("title")?;
+    if title.chars().count() > 120 {
+        return Err("标题过长。".into());
+    }
+    let media = vod_url(&q("media")?, "video")?;
+    let audio = vod_url(&q("audio")?, "audio")?;
+    let media_url = url::Url::parse(&media).unwrap();
+    let audio_url = url::Url::parse(&audio).unwrap();
+    let marker = |url: &url::Url| {
+        url.query_pairs()
+            .find(|(key, _)| key == "l")
+            .map(|(_, value)| value.into_owned())
+    };
+    if marker(&media_url).is_none() || marker(&media_url) != marker(&audio_url) {
+        return Err("画面和声音不属于同一次播放，请重新发送。".into());
+    }
+    let duration: f64 = q("duration")?.parse().map_err(|_| "时长无效。")?;
+    let width: u32 = q("width")?.parse().map_err(|_| "分辨率无效。")?;
+    let height: u32 = q("height")?.parse().map_err(|_| "分辨率无效。")?;
+    if !(0.0..=86_400.0).contains(&duration) || width > 7680 || height > 4320 {
+        return Err("视频信息不合理。".into());
+    }
+    Ok(Import {
+        video_id,
+        page,
+        title,
+        media,
+        audio,
+        duration,
+        width,
+        height,
+    })
+}
+fn offer(app: &tauri::AppHandle, link: &url::Url) {
+    match import_from(link) {
+        Ok(import) => {
+            let state = app.state::<AppState>();
+            let mut slot = state.pending.lock().unwrap();
+            if slot.is_some() {
+                let _ = app.emit("import-busy", "已有待确认的视频，请先下载或取消。");
+                return;
+            }
+            *slot = Some(import.clone());
+            let _ = app.emit("import", import);
+        }
+        Err(error) => {
+            let _ = app.emit("import-error", error);
+        }
+    }
 }
 fn kill_tree(pid: u32, force: bool) {
     #[cfg(unix)]
@@ -180,6 +349,14 @@ fn kill_tree(pid: u32, force: bool) {
 #[tauri::command]
 fn snapshot(state: State<AppState>) -> Store {
     state.store.lock().unwrap().clone()
+}
+#[tauri::command]
+fn pending_import(state: State<AppState>) -> Option<Import> {
+    state.pending.lock().unwrap().clone()
+}
+#[tauri::command]
+fn dismiss_import(state: State<AppState>) {
+    *state.pending.lock().unwrap() = None;
 }
 
 #[tauri::command]
@@ -217,8 +394,18 @@ async fn start_download(
     url: String,
     quality: String,
 ) -> Result<Job, String> {
-    let url = validate(&url, &quality)?;
     let state = app.state::<AppState>();
+    let direct = state
+        .pending
+        .lock()
+        .unwrap()
+        .clone()
+        .filter(|item| item.media == url);
+    let referer = direct.as_ref().map(|_| REFERER);
+    let name = direct
+        .as_ref()
+        .map(|item| (item.title.clone(), item.video_id.clone()));
+    let url = validate(&url, &quality)?;
     let mut active = state.active.lock().unwrap();
     if active.is_some() {
         return Err("已有任务正在下载，请完成或取消后再添加。".into());
@@ -236,11 +423,40 @@ async fn start_download(
         "yt-dlp"
     });
     let mut command = Command::new(executable);
+    let mut args = args_named(
+        &url,
+        &quality,
+        &directory,
+        &engines,
+        referer,
+        name.as_ref()
+            .map(|(title, id)| (title.as_str(), id.as_str())),
+    );
+    let info = direct.as_ref().map(|item| {
+        serde_json::to_vec(&serde_json::json!({
+            "id": item.video_id,
+            "title": item.title,
+            "webpage_url": item.page,
+            "extractor": "generic",
+            "formats": [
+                { "format_id": "video", "url": item.media, "vcodec": "hvc1", "acodec": "none", "ext": "mp4", "width": item.width, "height": item.height },
+                { "format_id": "audio", "url": item.audio, "vcodec": "none", "acodec": "mp4a", "ext": "m4a" }
+            ]
+        })).map_err(|e| e.to_string())
+    }).transpose()?;
+    if info.is_some() {
+        args.truncate(args.len() - 2);
+        args.extend(["--load-info-json".into(), "-".into()]);
+    }
     command
-        .args(args(&url, &quality, &directory, &engines))
+        .args(args)
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUTF8", "1")
-        .stdin(std::process::Stdio::null())
+        .stdin(if info.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     #[cfg(unix)]
@@ -262,12 +478,22 @@ async fn start_download(
         .to_string();
     let job = Job {
         id: id.clone(),
-        title: url::Url::parse(&url)
-            .unwrap()
-            .host_str()
-            .unwrap_or("视频")
-            .into(),
-        url,
+        title: direct
+            .as_ref()
+            .map(|item| item.title.clone())
+            .unwrap_or_else(|| {
+                url::Url::parse(&url)
+                    .unwrap()
+                    .host_str()
+                    .unwrap_or("视频")
+                    .into()
+            }),
+        url: direct.as_ref().map(|item| item.page.clone()).unwrap_or(url),
+        source: if direct.is_some() {
+            "douyin".into()
+        } else {
+            String::new()
+        },
         quality,
         status: "preparing".into(),
         progress: 0.0,
@@ -276,6 +502,9 @@ async fn start_download(
         file: None,
     };
     state.store.lock().unwrap().jobs.insert(0, job.clone());
+    if direct.is_some() {
+        *state.pending.lock().unwrap() = None;
+    }
     if let Err(error) = save(&state) {
         kill_tree(pid, true);
         state.store.lock().unwrap().jobs.retain(|j| j.id != id);
@@ -292,6 +521,14 @@ async fn start_download(
     let stderr = child.stderr.take().unwrap();
     let worker_app = app.clone();
     tauri::async_runtime::spawn(async move {
+        let input_error = if let Some(info) = info {
+            child.stdin.take().unwrap().write_all(&info).await.err()
+        } else {
+            None
+        };
+        if input_error.is_some() {
+            kill_tree(pid, true);
+        }
         let error_reader = tauri::async_runtime::spawn(async move {
             let mut reader = BufReader::new(stderr);
             let mut bytes = [0u8; 4096];
@@ -322,19 +559,31 @@ async fn start_download(
                 parse_line(&event_app, &event_id, &line);
             }
         });
-        let (cancelled, result) = tokio::select! {
-            result = child.wait() => (false, result),
-            _ = &mut rx => {
-                kill_tree(pid, false);
-                let result = match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
-                    Ok(result) => result,
-                    Err(_) => { kill_tree(pid, true); child.wait().await }
-                };
-                (true, result)
+        let (cancelled, result) = if input_error.is_some() {
+            (false, child.wait().await)
+        } else {
+            tokio::select! {
+                result = child.wait() => (false, result),
+                _ = &mut rx => {
+                    kill_tree(pid, false);
+                    let result = match tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await {
+                        Ok(result) => result,
+                        Err(_) => { kill_tree(pid, true); child.wait().await }
+                    };
+                    (true, result)
+                }
             }
         };
         let _ = output_reader.await;
-        let error = error_reader.await.unwrap_or_default();
+        let mut error = error_reader.await.unwrap_or_default();
+        if let Some(input_error) = input_error {
+            error = format!("无法发送视频信息给下载工具：{input_error}");
+        }
+        if let Some(import) = &direct {
+            error = error
+                .replace(&import.media, "[画面地址]")
+                .replace(&import.audio, "[声音地址]");
+        }
         let successful = result.map(|r| r.success()).unwrap_or(false);
         update(&worker_app, &id, |j| {
             j.status = if cancelled {
@@ -467,8 +716,10 @@ fn clear_history(state: State<AppState>) -> Result<(), String> {
 }
 fn main() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|_app, _argv, _cwd| {}))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_deep_link::init())
         .setup(|app| {
             let dir = app.path().app_config_dir()?;
             std::fs::create_dir_all(&dir)?;
@@ -510,11 +761,25 @@ fn main() {
                 store: Mutex::new(store),
                 active: Mutex::new(None),
                 config,
+                pending: Mutex::new(None),
+            });
+            if let Ok(Some(urls)) = app.deep_link().get_current() {
+                if let Some(link) = urls.into_iter().next() {
+                    offer(app.handle(), &link);
+                }
+            }
+            let handle = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                if let Some(link) = event.urls().into_iter().next() {
+                    offer(&handle, &link);
+                }
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             snapshot,
+            pending_import,
+            dismiss_import,
             choose_directory,
             set_directory,
             start_download,
@@ -548,17 +813,24 @@ mod tests {
         }
         assert!(validate("https://example.com/a", "evil").is_err());
         let url = validate(" https://example.com/video?a=1&b=2 ", "1080").unwrap();
-        let arguments = args(
+        let arguments = args_for(
             &url,
             "1080",
             "/tmp/with spaces",
             std::path::Path::new("/engines"),
+            None,
         );
         assert_eq!(&arguments[arguments.len() - 2..], &["--", &url]);
         assert!(arguments.contains(&"bv*[height<=1080]+ba/b[height<=1080]".into()));
         assert!(arguments.contains(&"/tmp/with spaces".into()));
         assert!(arguments.contains(&"--ignore-config".into()));
-        let audio = args(&url, "audio", "/tmp", std::path::Path::new("/engines"));
+        let audio = args_for(
+            &url,
+            "audio",
+            "/tmp",
+            std::path::Path::new("/engines"),
+            None,
+        );
         assert!(audio.windows(2).any(|v| v == ["--audio-format", "m4a"]));
     }
 }

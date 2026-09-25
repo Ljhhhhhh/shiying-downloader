@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "拾影",
+  "version": "1.0.0",
+  "description": "把当前抖音视频发送到拾影",
+  "action": { "default_title": "发送到拾影" },
+  "permissions": ["activeTab", "scripting"],
+  "background": { "service_worker": "background.js" }
+}
