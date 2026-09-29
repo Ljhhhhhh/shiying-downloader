@@ -88,11 +88,37 @@ fn validate(url: &str, quality: &str) -> Result<String, String> {
     }
     let parse_link = |candidate: &str| {
         let parsed = url::Url::parse(candidate).ok()?;
-        (["https", "http"].contains(&parsed.scheme())
+        if !(["https", "http"].contains(&parsed.scheme())
             && parsed.host_str().is_some()
             && parsed.username().is_empty()
             && parsed.password().is_none())
-        .then(|| parsed.to_string())
+        {
+            return None;
+        }
+        if matches!(parsed.host_str(), Some("www.xiaohongshu.com" | "xiaohongshu.com"))
+            && parsed.path() == "/login"
+        {
+            if let Some((_, target)) = parsed.query_pairs().find(|(k, _)| k == "redirectPath") {
+                let target = target.trim();
+                if let Some(mut unwrapped) = url::Url::parse(target).ok().or_else(|| {
+                    target
+                        .starts_with("/")
+                        .then(|| parsed.join(target).ok())
+                        .flatten()
+                }) {
+                    if !matches!(unwrapped.host_str(), Some("www.xiaohongshu.com" | "xiaohongshu.com"))
+                        || !unwrapped.username().is_empty()
+                        || unwrapped.password().is_some()
+                    {
+                        return None;
+                    }
+                    let _ = unwrapped.set_scheme("https");
+                    return Some(unwrapped.to_string());
+                }
+            }
+            return None;
+        }
+        Some(parsed.to_string())
     };
     if let Some(link) = parse_link(url.trim()) {
         return Ok(link);
@@ -112,6 +138,49 @@ fn validate(url: &str, quality: &str) -> Result<String, String> {
     }
     Err("未找到有效的视频链接，请粘贴完整链接或分享内容。".into())
 }
+async fn resolve_xhs_link(link: String) -> Result<String, String> {
+    let parsed = url::Url::parse(&link).map_err(|e| e.to_string())?;
+    if !matches!(
+        parsed.host_str(),
+        Some("xhslink.cn" | "www.xhslink.cn" | "xhslink.com" | "www.xhslink.com")
+    ) {
+        return Ok(link);
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 {
+                return attempt.stop();
+            }
+            match attempt.url().host_str() {
+                Some(
+                    "xhslink.cn"
+                    | "www.xhslink.cn"
+                    | "xhslink.com"
+                    | "www.xhslink.com"
+                    | "www.xiaohongshu.com"
+                    | "xiaohongshu.com",
+                ) => attempt.follow(),
+                _ => attempt.stop(),
+            }
+        }))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let response = client
+        .get(link)
+        .send()
+        .await
+        .map_err(|e| format!("无法打开小红书短链接：{e}"))?;
+    let target = validate(response.url().as_str(), "best")?;
+    let note = url::Url::parse(&target).map_err(|e| e.to_string())?;
+    if !matches!(note.host_str(), Some("www.xiaohongshu.com" | "xiaohongshu.com"))
+        || !(note.path().starts_with("/explore/") || note.path().starts_with("/discovery/item/"))
+    {
+        return Err("小红书短链接未指向视频笔记，请重新复制分享链接。".into());
+    }
+    Ok(target)
+}
+#[cfg(test)]
 fn args_for(
     url: &str,
     quality: &str,
@@ -405,7 +474,7 @@ async fn start_download(
     let name = direct
         .as_ref()
         .map(|item| (item.title.clone(), item.video_id.clone()));
-    let url = validate(&url, &quality)?;
+    let url = resolve_xhs_link(validate(&url, &quality)?).await?;
     let mut active = state.active.lock().unwrap();
     if active.is_some() {
         return Err("已有任务正在下载，请完成或取消后再添加。".into());
